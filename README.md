@@ -105,6 +105,17 @@ local GPUs (e.g. to shake out coordination overhead before a real cluster run):
 mpirun -np <workers+1> ./bin/autodock_gpu_mpi_64wi --filelist examples/scaling/filelist_2000.txt --nrun 10
 ```
 
+It cycles through five test systems spanning a real range of ligand complexity, so generated jobs
+aren't all equally (in)expensive — useful context when interpreting scaling throughput:
+
+| PDB | Target | Ligand | Ligand atoms | Rotatable bonds |
+|:---:|:-------|:-------|:---:|:---:|
+| [1ac8](https://www.rcsb.org/structure/1AC8) | Engineered protein cavity (C-H···O H-bond study) | 3,4,5-trimethylthiazole | 8 | 0 |
+| [1stp](https://www.rcsb.org/structure/1STP) | Streptavidin | Biotin | 18 | 5 |
+| [3ce3](https://www.rcsb.org/structure/3CE3) | c-Met tyrosine kinase domain | Pyrrolopyridinepyridone-based inhibitor | 37 | 5 |
+| [3tmn](https://www.rcsb.org/structure/3TMN) | Thermolysin (zinc metalloprotease) | Val-Trp (hydrolysis product) | 27 | 1 |
+| [7cpa](https://www.rcsb.org/structure/7CPA) | Carboxypeptidase A (zinc metalloprotease) | Phosphonate inhibitor | 43 | 17 |
+
 After successful compilation, the host binary **autodock_&lt;type&gt;_&lt;N&gt;wi** is placed under [bin](./bin).
 
 | Binary-name portion | Description                  | Values                                            |

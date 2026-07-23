@@ -2,8 +2,19 @@
 # Generates a --filelist input of arbitrary size for exercising/benchmarking
 # the MPI dynamic task distribution (see MPI=ON in the top-level README) at
 # scale, by cycling through the receptor/ligand pairs already bundled under
-# input/. The docking chemistry is repeated/uninteresting; this is purely
-# about generating enough independent jobs to distribute across many ranks.
+# input/. This is purely about generating enough independent jobs to
+# distribute across many ranks, but the five test systems do span a real
+# range of ligand complexity (0-17 rotatable bonds), so job runtimes vary
+# rather than being N copies of one easy or one hard case:
+#
+#   PDB   Atoms  Rot.bonds  Target -> ligand
+#   1ac8    8       0       Engineered protein cavity (C-H...O bond study) -> 3,4,5-trimethylthiazole
+#   1stp   18       5       Streptavidin -> biotin
+#   3ce3   37       5       c-Met tyrosine kinase domain -> pyrrolopyridinepyridone-based inhibitor
+#   3tmn   27       1       Thermolysin (zinc metalloprotease) -> Val-Trp (hydrolysis product)
+#   7cpa   43      17       Carboxypeptidase A (zinc metalloprotease) -> phosphonate inhibitor
+#
+# See RCSB (rcsb.org/structure/<PDB>) for each structure's full details.
 #
 # Usage: ./generate_filelist.sh <num_jobs> [output_file]
 
