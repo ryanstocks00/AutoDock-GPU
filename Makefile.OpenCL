@@ -60,7 +60,7 @@ TOOL_TARGET := adgpu_analysis
 
 IFLAGS=-I$(COMMON_DIR) -I$(OCL_INC_DIR) -I$(HOST_INC_DIR) -I$(KRNL_DIR) -I$(OCLA_INC_PATH)
 LFLAGS=-L$(OCLA_LIB_PATH)
-CFLAGS=-std=c++11 $(IFLAGS) $(LFLAGS)
+CFLAGS=$(CXXSTD) $(IFLAGS) $(LFLAGS) $(MPIFLAGS)
 TOOL_CFLAGS=-std=c++11 -I$(COMMON_DIR) -I$(HOST_INC_DIR)
 
 # Host sources
@@ -90,6 +90,23 @@ endif
 
 ifeq ($(OVERLAP), ON)
 	PIPELINE=-DUSE_PIPELINE -fopenmp
+endif
+
+# ------------------------------------------------------
+# Optional dynamic task distribution across MPI ranks/nodes via DynaMPI
+# (https://github.com/ryanstocks00/DynaMPI, vendored as a git submodule).
+# See Makefile.Cuda for details; run one MPI rank per GPU (+1 for the manager).
+DYNAMPI_DIR = ./third_party/DynaMPI
+ifeq ($(MPI), ON)
+	DYNAMPI_COMMIT := $(shell git -C $(DYNAMPI_DIR) rev-parse --short HEAD 2>/dev/null || echo unknown)
+	MPIFLAGS = -DUSE_MPI -I$(DYNAMPI_DIR)/include \
+	           -DDYNAMPI_VERSION_MAJOR=0 -DDYNAMPI_VERSION_MINOR=0 -DDYNAMPI_VERSION_PATCH=1 \
+	           -DDYNAMPI_COMMIT_HASH=\"$(DYNAMPI_COMMIT)\"
+	CPP = mpicxx
+	CXXSTD = -std=c++20
+	TARGET:=$(TARGET)_mpi
+else
+	CXXSTD = -std=c++11
 endif
 
 BIN := $(wildcard $(TARGET)*)
@@ -263,6 +280,9 @@ otool: unlink-code
 	-o$(BIN_DIR)/$(TOOL_TARGET) \
 	$(PIPELINE) $(OPT) -DTOOLMODE $(REP)
 
+$(DYNAMPI_DIR)/include/dynampi/dynampi.hpp:
+	git submodule update --init --recursive $(DYNAMPI_DIR)
+
 odock: check-env-all stringify link-code
 	@echo "Building" $(TARGET) "..."
 	$(CPP) \
@@ -271,6 +291,10 @@ odock: check-env-all stringify link-code
 	$(LIB_OPENCL) \
 	-o$(BIN_DIR)/$(TARGET) \
 	$(DEV) $(NWI) $(PIPELINE) $(OPT) $(DD) $(REP) $(KFLAGS)
+
+ifeq ($(MPI), ON)
+odock: $(DYNAMPI_DIR)/include/dynampi/dynampi.hpp
+endif
 
 # Example
 # 1ac8: for testing gradients of translation and rotation genes

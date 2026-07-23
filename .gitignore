@@ -2,6 +2,7 @@
 initpop.txt
 *.dlg
 *.xml
+examples/scaling/filelist_*.txt
 input/albumin_dock/
 ocladock.wiki/
 bin/

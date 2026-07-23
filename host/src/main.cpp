@@ -28,6 +28,10 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
 #ifdef USE_PIPELINE
 #include <omp.h>
 #endif
+#ifdef USE_MPI
+#include <mpi.h>
+#include <dynampi/dynampi.hpp>
+#endif
 #include <vector>
 
 #include "processgrid.h"
@@ -77,6 +81,15 @@ inline void start_timer(T& time_start)
 
 int main(int argc, char* argv[])
 {
+#if defined(USE_MPI) && !defined(TOOLMODE)
+	MPI_Init(&argc, &argv);
+	int mpi_rank = 0, mpi_size = 1;
+	MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+	MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
+	// With >1 rank, the manager (rank 0) only dispatches jobs and never docks itself
+	// (see dynampi::mpi_manager_worker_distribution), so it needs no GPU of its own.
+	const bool mpi_is_dedicated_manager = (mpi_size > 1) && (mpi_rank == 0);
+#endif
 	// Print version info
 	printf("AutoDock-GPU version: %s\n\n", AD_VERSION);
 	// Print help screen if no parameters were specified
@@ -187,6 +200,23 @@ int main(int argc, char* argv[])
 #ifndef USE_PIPELINE
 	if(nr_devices>1) printf("Info: Parallelization over multiple GPUs is only available if OVERLAP=ON is specified when AD-GPU is build.\n\n");
 #endif
+#if defined(USE_MPI) && !defined(TOOLMODE)
+	if(nr_devices>1) printf("Info: In MPI mode, each rank uses a single local GPU; launch one MPI rank per GPU (see --devnum) instead of listing multiple devices for one rank.\n\n");
+	if(mpi_size>1 && devnum<0 && initial_pars.dev_pool.empty()){
+		// Auto-bind each worker rank to one local GPU, round-robin, excluding the dedicated manager rank
+		MPI_Comm node_comm, node_worker_comm;
+		MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, mpi_rank, MPI_INFO_NULL, &node_comm);
+		MPI_Comm_split(node_comm, mpi_is_dedicated_manager ? MPI_UNDEFINED : 0, mpi_rank, &node_worker_comm);
+		if(node_worker_comm != MPI_COMM_NULL){
+			int local_worker_rank = 0;
+			MPI_Comm_rank(node_worker_comm, &local_worker_rank);
+			int local_gpu_count = (int)get_gpu_pool().size();
+			if(local_gpu_count>0) devnum = local_worker_rank % local_gpu_count;
+			MPI_Comm_free(&node_worker_comm);
+		}
+		MPI_Comm_free(&node_comm);
+	}
+#endif
 #endif
 	if(initial_pars.xml2dlg){
 		if(initial_pars.contact_analysis)
@@ -246,7 +276,11 @@ int main(int argc, char* argv[])
 	std::vector<int> err(n_files,0);
 
 #ifndef TOOLMODE
-	if(!initial_pars.xml2dlg && (nr_devices==1))
+	if(!initial_pars.xml2dlg && (nr_devices==1)
+#ifdef USE_MPI
+	   && !mpi_is_dedicated_manager
+#endif
+	  )
 		setup_gpu_for_docking(cData[0],tData[0]);
 #endif
 	total_setup_time+=seconds_since(time_start);
@@ -258,6 +292,197 @@ int main(int argc, char* argv[])
 		}
 	}
 
+#if defined(USE_MPI) && !defined(TOOLMODE)
+	// Dynamic task distribution across MPI ranks (DynaMPI), superseding the
+	// OpenMP/local dynamic scheduling below: each rank docks one job at a
+	// time on its own local GPU, dynamically pulling the next job index
+	// from the manager rank until none remain (see docs/DynaMPI.md-style
+	// note in the README for deployment: one rank per GPU, +1 for the
+	// manager). Falls back to identical sequential behavior on a single rank.
+	{
+		char outbuf[256];
+		Dockpars   mypars = initial_pars;
+		Liganddata myligand_init;
+		Gridinfo*  mygrid = &initial_grid;
+		Liganddata myxrayligand;
+		SimulationState sim_state;
+		int dev_nr = 0;
+#ifndef _WIN32
+		timeval setup_timer, exec_timer, processing_timer;
+#else
+		double setup_timer, exec_timer, processing_timer;
+#endif
+		// Result encodes (job index, error flag) as job*2+flag so the manager can
+		// scatter results correctly even though they arrive in completion order,
+		// not submission order (see DynaMPI's hierarchical distributor docs).
+		auto process_job = [&](size_t i_job_sz) -> long long {
+			int i_job = (int)i_job_sz;
+			// Setup the next file in the queue
+			if(filelist.used){
+				mypars = filelist.mypars[i_job];
+				mygrid = &filelist.mygrids[mypars.filelist_grid_idx];
+			}
+			if(mypars.contact_analysis){
+				if(filelist.preload_maps){ // use preloaded data for receptor
+					mypars.receptor_atoms    = initial_pars.receptor_atoms;
+					mypars.nr_receptor_atoms = mypars.receptor_atoms.size();
+					mypars.receptor_map      = initial_pars.receptor_map;
+					mypars.receptor_map_list = initial_pars.receptor_map_list;
+				}
+			}
+			if(mypars.xml2dlg){
+				if(!mypars.dlg2stdout && (n_files>100))
+					if((50*(i_job+1)) % n_files < 50){
+						printf("*"); fflush(stdout);
+					}
+			} else {
+				printf ("(Rank %d is setting up Job #%d)\n",mpi_rank,i_job+1); fflush(stdout);
+			}
+			start_timer(setup_timer);
+			// Load files, read inputs, prepare arrays for docking stage
+			if (setup(mygrid, &mypars, myligand_init, myxrayligand, filelist, i_job, argc, argv) != 0) {
+				// If error encountered: Set error flag to 1; Add to count of finished jobs
+				printf("\nError in setup of Job #%d", i_job+1);
+				if (filelist.used){
+					printf(":\n");
+					printf("(   Grid map file: %s )\n",  mypars.fldfile);
+					printf("(   Ligand file: %s )\n", mypars.ligandfile); fflush(stdout);
+					if(mypars.flexresfile)
+						printf("(   Flexible residue: %s )\n", mypars.flexresfile);
+					fflush(stdout);
+				} else printf("\n");
+				return (long long)i_job*2 + 1;
+			} else { // Successful setup
+				total_setup_time+=seconds_since(setup_timer);
+			}
+
+			// Starting Docking or loading results
+			if(mypars.xml2dlg){
+				start_timer(setup_timer);
+				// allocating CPU memory for initial populations
+				mypars.output_xml = false;
+				int nrot;
+				sim_state.cpu_populations = read_xml_genomes(mypars.load_xml, mygrid->spacing, nrot, true);
+				if(nrot!=myligand_init.num_of_rotbonds){
+					printf("\nError: XML genome contains %d rotatable bonds but current ligand has %d.\n",nrot,myligand_init.num_of_rotbonds);
+					exit(2);
+				}
+				double movvec_to_origo[3];
+				sim_state.myligand_reference = myligand_init;
+				get_movvec_to_origo(&(sim_state.myligand_reference), movvec_to_origo);
+				double flex_vec[3];
+				for (unsigned int i=0; i<3; i++)
+					flex_vec [i] = -mygrid->origo_real_xyz [i];
+				move_ligand(&(sim_state.myligand_reference), movvec_to_origo, flex_vec);
+				scale_ligand(&(sim_state.myligand_reference), 1.0/mygrid->spacing);
+				get_moving_and_unit_vectors(&(sim_state.myligand_reference));
+				mypars.pop_size = 1;
+				mypars.num_of_runs = sim_state.cpu_populations.size()/GENOTYPE_LENGTH_IN_GLOBMEM;
+				// allocating CPU memory for results
+				size_t size_energies = mypars.pop_size * mypars.num_of_runs * sizeof(float);
+				sim_state.cpu_energies.resize(size_energies);
+				// allocating memory in CPU for evaluation counters
+				size_t size_evals_of_runs = mypars.num_of_runs*sizeof(int);
+				sim_state.cpu_evals_of_runs.resize(size_evals_of_runs);
+				memset(sim_state.cpu_evals_of_runs.data(), 0, size_evals_of_runs);
+				total_setup_time+=seconds_since(setup_timer);
+				sim_state.idle_time = 0.0;
+				sim_state.exec_time = 0.0;
+			} else {
+				int error_in_docking;
+				std::string* output = NULL;
+				para_printf("\nRunning Job #%d", i_job+1);
+				if (filelist.used){
+					para_printf(":\n");
+					para_printf("    Device: %s\n", tData[dev_nr].device_name);
+					para_printf("    Grid map file: %s\n",  mypars.fldfile);
+					para_printf("    Ligand file: %s\n", mypars.ligandfile); fflush(stdout);
+					if(mypars.flexresfile)
+						para_printf("    Flexible residue: %s\n", mypars.flexresfile);
+					fflush(stdout);
+				} else para_printf("\n");
+				// End idling timer, start exec timer
+				sim_state.idle_time = seconds_since(idle_timer);
+				start_timer(exec_timer);
+				// Dock
+				error_in_docking = docking_with_gpu(mygrid, &(mypars), &(myligand_init), &(myxrayligand), profiler.p[(get_profiles ? i_job : 0)], &argc, argv, sim_state, cData[dev_nr], tData[dev_nr], output);
+				// End exec timer, start idling timer
+				sim_state.exec_time = seconds_since(exec_timer);
+				start_timer(idle_timer);
+				if (error_in_docking!=0){
+					para_printf("\nError in docking_with_gpu, stopped Job #%d.\n",i_job+1);
+					return (long long)i_job*2 + 1;
+				} else { // Successful run
+#ifndef _WIN32
+					total_exec_time+=sim_state.exec_time;
+					para_printf("\nJob #%d took %.3f sec after waiting %.3f sec for setup\n\n", i_job+1, sim_state.exec_time, sim_state.idle_time);
+					if (get_profiles && filelist.used){
+						// Detailed timing information to .timing
+						profiler.p[i_job].exec_time = sim_state.exec_time;
+					}
+#endif
+				}
+			}
+			// Post-processing
+			start_timer(processing_timer);
+			process_result(mygrid, &(mypars), &(myligand_init), &(myxrayligand), &argc,argv, sim_state);
+			total_processing_time+=seconds_since(processing_timer);
+			// Clean up memory dynamically allocated to not leak (safe whether mypars
+			// was reassigned per-job from filelist, or is the single initial copy)
+			mypars.receptor_atoms.clear();
+			if(mypars.fldfile) free(mypars.fldfile);
+			if(mypars.ligandfile) free(mypars.ligandfile);
+			if(mypars.flexresfile) free(mypars.flexresfile);
+			if(mypars.xrayligandfile) free(mypars.xrayligandfile);
+			if(mypars.resname) free(mypars.resname);
+			return (long long)i_job*2 + 0;
+		};
+
+		if(nr_devices>1 && mpi_rank==0)
+			printf("Info: MPI mode uses a single (local) GPU per rank; launch one rank per GPU instead.\n\n");
+
+		// Distributor choice trades off differently at different scales:
+		//  - naive:        flat manager<->worker, every rank a real worker (no GPU wasted
+		//                   on relaying), but the manager talks to every worker directly,
+		//                   which can become a bottleneck with very many ranks.
+		//  - hierarchical: tree of per-node coordinators so the manager only talks to one
+		//                   rank per node; scales to thousands of ranks, but each node
+		//                   sacrifices one local worker (one GPU) to coordination duty.
+		//  - lockfree:     one-sided RMA gets/puts instead of send/recv messaging; avoids
+		//                   both the coordinator tax and a single-manager bottleneck, at
+		//                   the cost of a fixed task-table capacity (set from n_files here).
+		// Default is naive since most deployments here are a handful of GPUs per node,
+		// where wasting one to coordination duty is proportionally expensive. Override with
+		// the DYNAMPI_DISTRIBUTOR environment variable for large (thousands-of-rank) runs.
+		const char* distributor_env = getenv("DYNAMPI_DISTRIBUTOR");
+		std::string distributor_choice = distributor_env ? distributor_env : "naive";
+		std::optional<std::vector<long long>> results;
+		if (distributor_choice == "hierarchical") {
+			if(mpi_rank==0) printf("Info: Using DynaMPI's hierarchical (per-node coordinator) distributor.\n\n");
+			results = dynampi::mpi_manager_worker_distribution<long long, dynampi::HierarchicalMPIWorkDistributor>((size_t)n_files, process_job);
+		} else if (distributor_choice == "lockfree") {
+			if(mpi_rank==0) printf("Info: Using DynaMPI's lock-free RMA distributor.\n\n");
+			dynampi::LockFreeMPIWorkDistributor<size_t, long long>::Config lockfree_config;
+			lockfree_config.max_tasks = std::max((size_t)8192, (size_t)n_files*2);
+			dynampi::LockFreeMPIWorkDistributor<size_t, long long> distributor(process_job, lockfree_config);
+			if (distributor.is_root_manager()) {
+				for (size_t i=0; i<(size_t)n_files; ++i) distributor.insert_task(i);
+				results = distributor.finish_remaining_tasks();
+			}
+		} else {
+			if (distributor_choice != "naive" && mpi_rank==0)
+				printf("Warning: Unknown DYNAMPI_DISTRIBUTOR '%s', falling back to 'naive'. Valid values: naive, hierarchical, lockfree.\n\n", distributor_choice.c_str());
+			results = dynampi::mpi_manager_worker_distribution<long long, dynampi::NaiveMPIWorkDistributor>((size_t)n_files, process_job);
+		}
+		if (results.has_value()) { // this rank is the manager (or the sole rank, running without mpirun)
+			for (long long encoded : *results) {
+				size_t job = (size_t)(encoded / 2);
+				int code = (int)(encoded % 2);
+				if (job < err.size()) err[job] = code;
+			}
+		}
+	}
+#else
 #ifdef USE_PIPELINE
 	#pragma omp parallel
 	{
@@ -489,10 +714,14 @@ int main(int argc, char* argv[])
 			if(mypars.resname) free(mypars.resname);
 		}
 	} // end of parallel section
+#endif
 	if(initial_pars.xml2dlg && !initial_pars.dlg2stdout && (n_files>100)) printf("\n\n"); // finish progress bar
 
 	
 #ifndef _WIN32
+#if defined(USE_MPI) && !defined(TOOLMODE)
+	if(mpi_rank==0){ // only the manager (or the sole rank) has the complete, aggregated timing/error data
+#endif
 	// Total time measurement
 	printf("Run time of entire job set (%d file%s): %.3f sec\n", n_files, n_files>1?"s":"", seconds_since(time_start));
 #ifdef USE_PIPELINE
@@ -506,6 +735,9 @@ int main(int argc, char* argv[])
 #else
 	printf("Processing time: %.3f sec\n",total_processing_time);
 #endif
+#if defined(USE_MPI) && !defined(TOOLMODE)
+	}
+#endif
 #endif
 #ifndef TOOLMODE
 	for(int i=0; i<nr_devices; i++){
@@ -515,6 +747,9 @@ int main(int argc, char* argv[])
 		if(!initial_pars.xml2dlg)
 			finish_gpu_from_docking(cData[i],tData[i]);
 	}
+#endif
+#if defined(USE_MPI) && !defined(TOOLMODE)
+	if(mpi_rank==0){ // only the manager (or the sole rank) has the complete, aggregated error data
 #endif
 	// Alert user to ligands that failed to complete
 	int n_errors=0;
@@ -530,6 +765,12 @@ int main(int argc, char* argv[])
 		}
 	}
 	if (n_errors==0) printf("\nAll jobs ran without errors.\n");
+#if defined(USE_MPI) && !defined(TOOLMODE)
+	}
+#endif
 
+#if defined(USE_MPI) && !defined(TOOLMODE)
+	MPI_Finalize();
+#endif
 	return 0;
 }

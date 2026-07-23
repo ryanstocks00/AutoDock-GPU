@@ -54,6 +54,57 @@ When `DEVICE=GPU` is chosen, the Makefile will automatically tests if it can com
 Note that the version compiled with `DEVICE=XeGPU` can also run on CPUs.
 Hints: The best work-group size depends on the GPU and workload. Try `NUMWI=128` or `NUMWI=64` for modern cards with the example workloads. Not all work-group sizes work with all accelerators. On macOS, use `NUMWI=1` for CPUs.
 
+## Optional: MPI-based dynamic task distribution (DynaMPI)
+
+For CUDA and OpenCL builds, `MPI=ON` distributes ligand-docking jobs dynamically across MPI
+ranks/nodes: whichever rank finishes its current job first is dynamically handed the next one,
+using [DynaMPI](https://github.com/ryanstocks00/DynaMPI) (vendored as a git submodule under
+`third_party/DynaMPI`) for the manager/worker distribution. This *replaces* the local `OVERLAP=ON`
+OpenMP pipeline as the job-dispatch mechanism (the two aren't meant to be combined): each rank uses
+a single local GPU, so for multiple GPUs per node, launch multiple ranks per node — one per GPU,
+plus one extra rank overall as the (non-docking) manager:
+
+```zsh
+git submodule update --init --recursive   # first time only
+make DEVICE=CUDA NUMWI=64 MPI=ON
+mpirun -np <workers+1> ./bin/autodock_gpu_mpi_64wi --filelist <jobs>.txt --nrun <nruns>
+```
+
+Requires a C++20-capable compiler and an MPI implementation (MPICH, Open MPI, Intel MPI); the
+`MPI=ON` build switches the host compiler to `mpicxx` and bumps the C++ standard to C++20
+accordingly. When run as a single process (no `mpirun`, or `-np 1`), behavior is unchanged from a
+plain build. If `--devnum` isn't set explicitly, each worker rank auto-binds to one local GPU,
+round-robin by node.
+
+### Choosing a distributor at scale
+
+`DYNAMPI_DISTRIBUTOR` (environment variable, read at runtime) selects which of DynaMPI's
+distribution strategies to use:
+
+| Value           | Strategy                              | Trade-off                                                                                     |
+|:----------------|:---------------------------------------|:------------------------------------------------------------------------------------------------|
+| `naive` (default)| Flat manager \<-\> worker              | Every rank is a real (GPU-bound) worker, but the manager messages each one directly — fine up to at least dozens of ranks, potentially a bottleneck at very large counts. |
+| `hierarchical`   | Tree of per-node coordinators           | Manager only talks to one rank per node, so it scales to thousands of ranks — but each node sacrifices one local worker (one GPU) to pure coordination duty. Worth it once nodes have many GPUs each; wasteful with only 1-2 GPUs per node. |
+| `lockfree`       | One-sided MPI RMA gets/puts             | Avoids both the coordinator tax and the single-manager bottleneck; capacity is fixed up front (sized from your job count here), and it's the newest/least battle-tested of the three. |
+
+```zsh
+DYNAMPI_DISTRIBUTOR=hierarchical mpirun -np <workers+1> ./bin/autodock_gpu_mpi_64wi --filelist <jobs>.txt --nrun <nruns>
+```
+
+An unrecognized value falls back to `naive` with a warning.
+
+### Generating inputs for scaling tests
+
+[`examples/scaling/generate_filelist.sh`](examples/scaling/generate_filelist.sh) builds a
+`--filelist` input of any size by cycling through the receptor/ligand pairs already bundled under
+[`input/`](input), so the dynamic distribution can be exercised with far more jobs than you have
+local GPUs (e.g. to shake out coordination overhead before a real cluster run):
+
+```zsh
+./examples/scaling/generate_filelist.sh 2000                  # writes examples/scaling/filelist_2000.txt
+mpirun -np <workers+1> ./bin/autodock_gpu_mpi_64wi --filelist examples/scaling/filelist_2000.txt --nrun 10
+```
+
 After successful compilation, the host binary **autodock_&lt;type&gt;_&lt;N&gt;wi** is placed under [bin](./bin).
 
 | Binary-name portion | Description                  | Values                                            |
